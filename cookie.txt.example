@@ -1,0 +1,9 @@
+# 复制本文件为 cookie.txt，然后把浏览器里网易云音乐的整条 Cookie 粘到下面这一行
+#
+# 取得方式：浏览器登录 music.163.com → F12 → Network → 任一请求 → Request Headers → Cookie
+#
+# 最少只要 MUSIC_U=<值>，贴整条风控更宽松。
+# 没有黑胶会员也能跑，但部分歌曲只能拿到 standard 音质或拿不到链接。
+#
+# 注意：cookie.txt 已在 .gitignore 里，改完不要 commit / push。
+MUSIC_U=

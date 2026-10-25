@@ -250,6 +250,36 @@ Content-Type: application/json
 ```
 **响应**: 直接返回音频文件流
 
+#### 7. 流式播放（本项目新增）
+```http
+GET /stream?id=185668&level=exhigh
+```
+**响应**: `audio/mpeg` 流，支持 `Range`（可拖进度条）
+
+和 `/download` 的区别：`/download` 会**先把整首歌下载到服务器磁盘再发**，13MB 的歌首字节要 12 秒；
+`/stream` 拿到直链后**边下边发**，首字节 0.3 秒左右，适合给网页播放器当 `<audio src>`。
+
+```bash
+# 探测可用性（HEAD 只回响应头）
+curl -I "http://127.0.0.1:5000/stream?id=185668&level=exhigh"
+# 期望: 200 / 206、Content-Type: audio/mpeg、Accept-Ranges: bytes
+
+# 测首字节
+curl -o /dev/null -w "TTFB=%{time_starttransfer}s\n" -r 0-65535 \
+  "http://127.0.0.1:5000/stream?id=185668&level=exhigh"
+```
+
+> ⚠️ 反代到 nginx 时**必须关掉缓冲**，否则等于又变回 `/download` 的行为：
+> ```nginx
+> location / {
+>     proxy_pass http://127.0.0.1:5000;
+>     proxy_buffering off;
+>     proxy_request_buffering off;
+>     proxy_http_version 1.1;
+>     proxy_read_timeout 300s;
+> }
+> ```
+
 ---
 
 ## 音质参数说明（仅限单曲解析）

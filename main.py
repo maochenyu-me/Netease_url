@@ -16,11 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import quote
-from flask import Flask, request, send_file, render_template, Response
+import requests
+from flask import Flask, request, send_file, render_template, Response, stream_with_context
 
 try:
     from music_api import (
-        NeteaseAPI, APIException, QualityLevel,
+        NeteaseAPI, APIException, QualityLevel, APIConstants,
         url_v1, name_v1, lyric_v1, search_music,
         playlist_detail, album_detail,
         load_cookies,
@@ -620,6 +621,7 @@ def api_info():
                 '/playlist': 'GET/POST - 获取歌单详情',
                 '/album': 'GET/POST - 获取专辑详情',
                 '/download': 'GET/POST - 下载音乐',
+                '/stream': 'GET - 流式播放（边下边发，支持 Range）',
                 '/api/info': 'GET - API信息'
             },
             'supported_qualities': [
@@ -640,6 +642,108 @@ def api_info():
         return APIResponse.error(f"获取API信息失败: {str(e)}", 500)
 
 
+@app.route('/stream', methods=['GET', 'HEAD'])
+def stream_music():
+    """流式转发音频：边下边发，透传 Range（支持拖动进度）。
+
+    与 /download 的区别：
+      /download   先把整首歌下载到服务器磁盘，再 send_file —— 13MB 的歌首字节要 12 秒；
+      /stream     拿到 CDN 直链后直接用 requests 的 stream 转发，首字节约 0.3~1 秒，
+                  并且把 Range / Content-Range / Content-Length 原样透传，
+                  <audio> 才能算总时长、拖进度条。
+    """
+    try:
+        song_id = request.args.get('id') or request.args.get('ids') or request.args.get('url')
+        level = request.args.get('level', 'exhigh')
+
+        if not song_id:
+            return APIResponse.error("缺少 'id' 参数")
+
+        valid_levels = ['standard', 'exhigh', 'lossless', 'hires',
+                        'sky', 'jyeffect', 'jymaster', 'dolby']
+        if level not in valid_levels:
+            return APIResponse.error(f"无效的音质参数，支持: {', '.join(valid_levels)}")
+
+        music_id = api_service._extract_music_id(song_id)
+        cookies = api_service._get_cookies()
+        # 直链带时效签名，每次现取，不缓存
+        try:
+            url_info = _resolve_song_url(music_id, level, cookies)
+        except Exception as e:
+            api_service.logger.warning(f"/stream 取直链失败 id={music_id}: {e}")
+            return APIResponse.error("获取播放链接失败（上游网络异常），请重试", 502)
+
+        data = (url_info or {}).get('data') or []
+        upstream_url = data[0].get('url') if data else None
+        if not upstream_url:
+            return APIResponse.error("获取音乐URL失败，可能是版权限制或音质不支持", 404)
+
+        headers = {
+            'User-Agent': APIConstants.USER_AGENT,
+            'Referer': APIConstants.REFERER,
+        }
+        # 浏览器拖动进度时会带 Range，原样转给 CDN
+        range_header = request.headers.get('Range')
+        if range_header:
+            headers['Range'] = range_header
+
+        upstream = requests.get(upstream_url, headers=headers, stream=True, timeout=config.request_timeout)
+        if upstream.status_code not in (200, 206):
+            code = upstream.status_code
+            upstream.close()
+            api_service.logger.warning(f"/stream 上游返回 {code}: {song_id}")
+            return APIResponse.error(f"上游返回 {code}", 502)
+
+        response = Response(
+            stream_with_context(_iter_upstream(upstream)),
+            status=upstream.status_code,
+            content_type=upstream.headers.get('Content-Type', 'audio/mpeg'),
+        )
+        # 分片信息必须原样透传，否则浏览器算不出总时长、拖不动进度条
+        for header in ('Content-Length', 'Content-Range', 'Accept-Ranges'):
+            if header in upstream.headers:
+                response.headers[header] = upstream.headers[header]
+        # Werkzeug 会给 str 型 content-type 自动补 `; charset=UTF-8`，音频不需要
+        response.headers['Content-Type'] = upstream.headers.get('Content-Type', 'audio/mpeg').split(';')[0].strip()
+        # 少数 CDN 节点不回 Accept-Ranges，但实际支持 Range；补上让浏览器敢拖进度
+        response.headers.setdefault('Accept-Ranges', 'bytes')
+        response.headers['Cache-Control'] = 'no-store'
+
+        # HEAD 只回响应头（客户端探测可用性用），不占着上游连接
+        if request.method == 'HEAD':
+            upstream.close()
+            response.response = []
+
+        return response
+
+    except Exception as e:
+        api_service.logger.error(f"/stream 异常: {e}\n{traceback.format_exc()}")
+        return APIResponse.error(f"流式转发失败: {str(e)}", 500)
+
+
+def _resolve_song_url(music_id, level: str, cookies, attempts: int = 3):
+    """取播放直链，失败重试几次（网易云接口偶发断连，一次失败就报错太脆）。"""
+    last_error = None
+    for i in range(attempts):
+        try:
+            return url_v1(music_id, level, cookies)
+        except Exception as e:
+            last_error = e
+            if i < attempts - 1:
+                time.sleep(0.4 * (i + 1))
+    raise last_error
+
+
+def _iter_upstream(upstream, chunk_size: int = 64 * 1024):
+    """按块转发上游响应体，异常或客户端断开时保证关闭连接。"""
+    try:
+        for chunk in upstream.iter_content(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+    finally:
+        upstream.close()
+
+
 def start_api_server():
     """启动API服务器"""
     try:
@@ -656,6 +760,7 @@ def start_api_server():
         print(f"  ├─ POST /playlist      - 获取歌单详情")
         print(f"  ├─ POST /album         - 获取专辑详情")
         print(f"  ├─ POST /download      - 下载音乐")
+        print(f"  ├─ GET  /stream        - 流式播放（支持 Range）")
         print(f"  └─ GET  /api/info      - API信息")
         print("\n🎵 支持的音质:")
         print(f"  standard, exhigh, lossless, hires, sky, jyeffect, jymaster")

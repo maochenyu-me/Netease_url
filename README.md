@@ -93,14 +93,22 @@ python main.py
 
 ### 🐳 Docker部署
 
-```bash
-# 使用Docker Compose
-docker-compose up -d
+镜像由 GitHub Actions 自动构建（amd64 / arm64），推到 GHCR：
 
-# 或使用Docker
-docker build -t netease-music-api .
-docker run -d -p 5000:5000 netease-music-api
+```bash
+# 直接跑（把 MUSIC_U 换成自己的）
+docker run -d --name netease-url -p 5000:5000 \
+  -e MUSIC_COOKIE='MUSIC_U=xxxx' \
+  --restart unless-stopped \
+  ghcr.io/maochenyu-me/netease-url:latest
+
+# 或者用 compose（cookie 写在 .env 里）
+cp .env.example .env && vi .env
+docker compose up -d
 ```
+
+自己构建：`docker build -t netease-url .`
+（国内网络加 `--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/`）
 
 ---
 
@@ -299,20 +307,83 @@ curl -o /dev/null -w "TTFB=%{time_starttransfer}s\n" -r 0-65535 \
 
 ## Docker 一键部署
 
-1. **修改参数**
+### 1. 拉镜像（推荐）
 
-   - 如需修改端口，请编辑 `.env` 或 `docker-compose.yml` 文件中的 `ports` 配置，例如：
+```bash
+docker pull ghcr.io/maochenyu-me/netease-url:latest
+```
 
-     ```yaml
-     ports:
-       - "8080:5000"
-     ```
+> 私有镜像要先登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <你的用户名> --password-stdin`
 
-2. **启动服务**
+### 2. 配 cookie（二选一）
 
-   ```bash
-   docker-compose up -d
-   ```
+**a) 环境变量**（最简单，改完 restart 生效）
+
+```bash
+docker run -d --name netease-url -p 5000:5000 \
+  -e MUSIC_COOKIE='整条 cookie 粘这里' \
+  --restart unless-stopped \
+  ghcr.io/maochenyu-me/netease-url:latest
+```
+
+**b) 挂载文件**（不想把 cookie 写进 `docker run` 历史）
+
+```bash
+cp cookie.txt.example cookie.txt && vi cookie.txt     # 粘整条 cookie
+docker run -d --name netease-url -p 5000:5000 \
+  -v "$(pwd)/cookie.txt:/app/cookie.txt:ro" \
+  --restart unless-stopped \
+  ghcr.io/maochenyu-me/netease-url:latest
+```
+
+> 镜像里**不含** cookie（`.dockerignore` 已排除）。没给 cookie 也能跑，只是 VIP/无损拿不到。
+
+### 3. 用 compose（推荐长期用）
+
+```bash
+cp .env.example .env
+vi .env            # 填 MUSIC_COOKIE
+docker compose up -d
+docker compose logs -f
+```
+
+`.env` / `cookie.txt` 都在 `.gitignore` 里，不会误提交。
+
+### 4. 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MUSIC_COOKIE` | 空 | 整条网易云 cookie，优先级高于 `cookie.txt` |
+| `PORT` | `5000` | 容器内监听端口，改了要同步改 `ports` 映射 |
+| `LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
+| `CORS_ORIGINS` | `*` | 允许的前端来源，纯前端直连保持 `*` |
+| `DOWNLOADS_DIR` | `downloads` | `/download` 的临时目录 |
+
+### 5. 反代（nginx / Caddy）
+
+**必须关掉响应缓冲**，否则 `/stream` 会退化成 `/download` 的体验（首字节十几秒）：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:5000;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_read_timeout 300s;
+}
+```
+
+### 6. 部署后自测
+
+```bash
+curl -s http://127.0.0.1:5000/health
+# {"data":{"cookie_status":"valid","service":"running",...}}
+
+curl -o /dev/null -w "TTFB=%{time_starttransfer}s code=%{http_code}\n" \
+  -r 0-65535 "http://127.0.0.1:5000/stream?id=287398&level=exhigh"
+# 期望 code=206、TTFB < 1.5s
+```
 
 ---
 

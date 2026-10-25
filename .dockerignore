@@ -1,3 +1,25 @@
+# 这些都不进镜像
+.git
+.github
+.gitignore
 LICENSE
 README.md
-.gitignore
+使用文档.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 凭证：绝不进镜像，运行时用 -e MUSIC_COOKIE 或 -v 挂载
+cookie.txt
+.env
+.env.*
+!.env.example
+
+# 运行时产物
+downloads/
+music_api.log
+*.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

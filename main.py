@@ -9,6 +9,7 @@
 """
 
 import logging
+import os
 import sys
 import time
 import traceback
@@ -24,7 +25,7 @@ try:
         NeteaseAPI, APIException, QualityLevel, APIConstants,
         url_v1, name_v1, lyric_v1, search_music,
         playlist_detail, album_detail,
-        load_cookies,
+        load_cookies, parse_cookie_string,
     )
     from music_downloader import MusicDownloader, DownloadException, AudioFormat
 except ImportError as e:
@@ -117,11 +118,18 @@ class MusicAPIService:
         return logger
     
     def _get_cookies(self) -> Dict[str, str]:
-        """直接从 cookie.txt 读取并解析为 dict"""
+        """优先读环境变量 ``MUSIC_COOKIE``（容器部署免挂文件），否则读 cookie.txt"""
+        env_cookie = os.getenv('MUSIC_COOKIE', '').strip()
+        if env_cookie:
+            cookies = parse_cookie_string(env_cookie)
+            if not cookies:
+                self.logger.warning("环境变量 MUSIC_COOKIE 无法解析，回退到 cookie.txt")
+            else:
+                return cookies
         try:
             cookies = load_cookies()
             if not cookies:
-                self.logger.warning("cookie.txt 为空或不存在，部分接口（VIP 音质）将不可用")
+                self.logger.warning("未提供 cookie（MUSIC_COOKIE 或 cookie.txt），部分接口（VIP 音质）将不可用")
             return cookies
         except Exception as e:
             self.logger.error(f"读取 cookie.txt 异常: {e}")
@@ -203,6 +211,12 @@ class MusicAPIService:
 
 # 创建Flask应用和服务实例
 config = APIConfig()
+# 容器化：允许用环境变量覆盖，改配置不必重建镜像
+config.host = os.getenv('HOST', config.host)
+config.port = int(os.getenv('PORT', str(config.port)))
+config.log_level = os.getenv('LOG_LEVEL', config.log_level)
+config.cors_origins = os.getenv('CORS_ORIGINS', config.cors_origins)
+config.downloads_dir = os.getenv('DOWNLOADS_DIR', config.downloads_dir)
 app = Flask(__name__)
 api_service = MusicAPIService(config)
 
@@ -259,8 +273,9 @@ def index() -> str:
 def health_check():
     """健康检查API"""
     try:
-        # 检查 Cookie 状态：直接读 cookie.txt
-        cookies = load_cookies()
+        # 检查 Cookie 状态：走统一的取 cookie 逻辑（优先 MUSIC_COOKIE 环境变量，其次 cookie.txt），
+        # 否则容器里用环境变量注入时，这里会误报 invalid
+        cookies = api_service._get_cookies()
         cookie_status = 'valid' if cookies else 'invalid'
 
         health_info = {

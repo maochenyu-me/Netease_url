@@ -14,3 +14,7 @@ cookie.txt
 # 运行时产物
 downloads/
 music_api.log
+
+# 环境变量文件（可能含 cookie），只保留示例
+.env
+!.env.example

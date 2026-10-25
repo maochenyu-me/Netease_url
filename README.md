@@ -277,6 +277,11 @@ curl -o /dev/null -w "TTFB=%{time_starttransfer}s\n" -r 0-65535 \
   "http://127.0.0.1:5000/stream?id=185668&level=exhigh"
 ```
 
+> 直链会在进程内存里缓存 5 分钟（`URL_CACHE_TTL` 可调，`0` 关闭）。
+> 因为一次播放会被浏览器拆成多个 Range 请求，不缓存的话每个分片都要重新换一次直链（1~2 秒）；
+> 命中缓存后只剩 CDN 往返，实测 TTFB 从 ~2s 降到 ~0.1s。
+> 直链过期或被防盗链（403/410）时会自动丢弃缓存、重新解析并重试一次。
+
 > ⚠️ 反代到 nginx 时**必须关掉缓冲**，否则等于又变回 `/download` 的行为：
 > ```nginx
 > location / {
@@ -358,6 +363,7 @@ docker compose logs -f
 | `LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 | `CORS_ORIGINS` | `*` | 允许的前端来源，纯前端直连保持 `*` |
 | `DOWNLOADS_DIR` | `downloads` | `/download` 的临时目录 |
+| `URL_CACHE_TTL` | `300` | 播放直链的内存缓存秒数，`0` 关闭 |
 
 ### 5. 反代（nginx / Caddy）
 

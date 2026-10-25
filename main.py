@@ -11,6 +11,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -220,6 +221,25 @@ config.downloads_dir = os.getenv('DOWNLOADS_DIR', config.downloads_dir)
 app = Flask(__name__)
 api_service = MusicAPIService(config)
 
+# ---- 播放直链缓存 ----
+# 一次播放会被浏览器拆成多个 Range 请求，每个都要换一次直链（eapi 往返 1~2 秒），
+# 缓存住就能让第 2 个请求之后直接打 CDN。设为 0 可关闭。
+def _env_int(name: str, default: int) -> int:
+    """读整型环境变量，写错不炸（容器里 env 打错一个字符就起不来太难排查）"""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        print(f"[warn] 环境变量 {name}={raw!r} 不是整数，用默认值 {default}")
+        return default
+
+
+_URL_CACHE_TTL = max(0, _env_int('URL_CACHE_TTL', 300))
+_url_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+_url_cache_lock = threading.Lock()
+
 
 @app.before_request
 def before_request():
@@ -284,7 +304,7 @@ def health_check():
             'cookie_status': cookie_status,
             'cookie_count': len(cookies),
             'downloads_dir': str(api_service.downloads_path.absolute()),
-            'version': '2.0.0'
+            'version': '2.1.0'
         }
 
         return APIResponse.success(health_info, "API服务运行正常")
@@ -627,7 +647,7 @@ def api_info():
     try:
         info = {
             'name': '网易云音乐API服务',
-            'version': '2.0.0',
+            'version': '2.1.0',
             'description': '提供网易云音乐相关API服务',
             'endpoints': {
                 '/health': 'GET - 健康检查',
@@ -681,15 +701,12 @@ def stream_music():
 
         music_id = api_service._extract_music_id(song_id)
         cookies = api_service._get_cookies()
-        # 直链带时效签名，每次现取，不缓存
+
         try:
-            url_info = _resolve_song_url(music_id, level, cookies)
+            upstream_url = _song_direct_url(music_id, level, cookies)
         except Exception as e:
             api_service.logger.warning(f"/stream 取直链失败 id={music_id}: {e}")
             return APIResponse.error("获取播放链接失败（上游网络异常），请重试", 502)
-
-        data = (url_info or {}).get('data') or []
-        upstream_url = data[0].get('url') if data else None
         if not upstream_url:
             return APIResponse.error("获取音乐URL失败，可能是版权限制或音质不支持", 404)
 
@@ -702,12 +719,28 @@ def stream_music():
         if range_header:
             headers['Range'] = range_header
 
-        upstream = requests.get(upstream_url, headers=headers, stream=True, timeout=config.request_timeout)
-        if upstream.status_code not in (200, 206):
-            code = upstream.status_code
-            upstream.close()
-            api_service.logger.warning(f"/stream 上游返回 {code}: {song_id}")
-            return APIResponse.error(f"上游返回 {code}", 502)
+        # 直链可能已过期 / 被防盗链 / 网络抖动：强制刷新一次再试
+        upstream = None
+        for attempt in (0, 1):
+            upstream, reason = _open_upstream(upstream_url, headers)
+            if upstream is not None and upstream.status_code in (200, 206):
+                break
+            if upstream is not None:
+                reason = f'HTTP {upstream.status_code}'
+                upstream.close()
+                upstream = None
+            api_service.logger.warning(f"/stream 上游失败（{reason}）第 {attempt + 1} 次 id={music_id}")
+            if attempt == 0:
+                try:
+                    upstream_url = _song_direct_url(music_id, level, cookies, force_refresh=True)
+                except Exception as e:
+                    api_service.logger.warning(f"/stream 刷新直链失败 id={music_id}: {e}")
+                    break
+                if not upstream_url:
+                    break
+
+        if upstream is None:
+            return APIResponse.error("上游音频获取失败（直链可能已过期），请稍后重试", 502)
 
         response = Response(
             stream_with_context(_iter_upstream(upstream)),
@@ -747,6 +780,55 @@ def _resolve_song_url(music_id, level: str, cookies, attempts: int = 3):
             if i < attempts - 1:
                 time.sleep(0.4 * (i + 1))
     raise last_error
+
+
+def _song_direct_url(music_id, level: str, cookies, force_refresh: bool = False) -> str:
+    """取播放直链（带进程内缓存），返回 '' 表示这首拿不到链接（无版权等）。
+
+    为什么要缓存：`/stream` 一次播放会被浏览器拆成**多个 Range 请求**（首段、缓冲续传、
+    拖动进度），而换直链的 eapi 往返实测占 1.2~2.1 秒 —— 每个分片都重算一次就是白等。
+    网易云直链有效期约 20 分钟，这里 TTL 默认 300 秒，留足余量；
+    另外上游返回 403/410 或连接失败时会强制刷新一次（见 stream_music），所以过期也不怕。
+    """
+    key = (str(music_id), level)
+    now = time.time()
+    if not force_refresh and _URL_CACHE_TTL > 0:
+        with _url_cache_lock:
+            hit = _url_cache.get(key)
+        if hit and hit[1] > now:
+            return hit[0]
+
+    last_error = None
+    for i in range(3):
+        try:
+            url_info = _resolve_song_url(music_id, level, cookies, attempts=1)
+        except Exception as e:
+            last_error = e
+            if i < 2:
+                time.sleep(0.4 * (i + 1))
+            continue
+
+        data = (url_info or {}).get('data') or []
+        url = (data[0].get('url') if data else None) or ''
+        if url and _URL_CACHE_TTL > 0:
+            with _url_cache_lock:
+                if len(_url_cache) > 256:
+                    for k in [k for k, v in _url_cache.items() if v[1] <= now]:
+                        _url_cache.pop(k, None)
+                _url_cache[key] = (url, now + _URL_CACHE_TTL)
+        return url
+
+    if last_error:
+        raise last_error
+    return ''
+
+
+def _open_upstream(url: str, headers: Dict[str, str]):
+    """打开上游音频流；失败返回 (None, 原因)。"""
+    try:
+        return requests.get(url, headers=headers, stream=True, timeout=config.request_timeout), ''
+    except requests.RequestException as e:
+        return None, f'连接失败: {e}'
 
 
 def _iter_upstream(upstream, chunk_size: int = 64 * 1024):

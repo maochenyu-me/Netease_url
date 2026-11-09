@@ -171,10 +171,13 @@ https://music.163.com/#/album?id=1234567890
 
 ### 基础信息
 - **Base URL**: `http://localhost:5000`
-- **请求方式**: GET / POST
-- **响应格式**: JSON
+- **请求方式**: GET / POST（GET 时参数走 query string；POST 支持 JSON 或表单，JSON 优先）
+- **响应格式**: JSON，统一结构为 `{"status": 200, "success": true, "message": "...", "data": {...}}`，
+  出错时 `success` 为 `false` 且不带 `data`
 
 ### 接口列表
+
+> 兼容性别名：`/Search`、`/Song_V1`、`/Playlist`、`/Album`、`/Download` 与对应小写接口完全等价，老客户端不用改。
 
 #### 1. 健康检查
 ```http
@@ -183,10 +186,22 @@ GET /health
 **响应示例**:
 ```json
 {
-  "status": "ok",
-  "message": "Service is running"
+  "status": 200,
+  "success": true,
+  "message": "API服务运行正常",
+  "data": {
+    "service": "running",
+    "timestamp": 1762712345,
+    "cookie_status": "valid",
+    "cookie_count": 12,
+    "downloads_dir": "/app/downloads",
+    "version": "2.1.0"
+  }
 }
 ```
+
+`cookie_status` 为 `valid` / `invalid`——容器里用 `MUSIC_COOKIE` 环境变量注入也算 `valid`，
+可以直接拿来当 K8s / compose 的存活探针（镜像里的 `HEALTHCHECK` 就是打这个接口）。
 
 #### 2. 歌曲搜索
 ```http
@@ -198,23 +213,33 @@ Content-Type: application/json
   "limit": 10
 }
 ```
+也可以走 GET：`GET /search?keywords=周杰伦 稻香&limit=10`
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `keywords` | 是 | 关键词，别名 `keyword` / `q` |
+| `limit` | 否 | 返回条数，默认 30，上限 100 |
+
 **响应示例**:
 ```json
 {
-  "code": 200,
-  "result": {
-    "songs": [
-      {
-        "id": 185668,
-        "name": "稻香",
-        "artists": ["周杰伦"],
-        "album": "魔杰座",
-        "duration": 223000
-      }
-    ]
-  }
+  "status": 200,
+  "success": true,
+  "message": "搜索完成",
+  "data": [
+    {
+      "id": 185668,
+      "name": "稻香",
+      "artists": "周杰伦",
+      "album": "魔杰座",
+      "picUrl": "http://p1.music.126.net/xxx.jpg",
+      "artist_string": "周杰伦"
+    }
+  ]
 }
 ```
+
+`data` 直接是歌曲数组；`artists` 是**用 `/` 拼好的字符串**（多歌手如 `周杰伦/费玉清`），不是数组。
 
 #### 3. 单曲解析
 ```http
@@ -293,6 +318,49 @@ curl -o /dev/null -w "TTFB=%{time_starttransfer}s\n" -r 0-65535 \
 > }
 > ```
 
+#### 8. API 信息
+```http
+GET /api/info
+```
+**响应示例**:
+```json
+{
+  "status": 200,
+  "success": true,
+  "message": "API信息获取成功",
+  "data": {
+    "name": "网易云音乐API服务",
+    "version": "2.1.0",
+    "description": "提供网易云音乐相关API服务",
+    "endpoints": {
+      "/health": "GET - 健康检查",
+      "/song": "GET/POST - 获取歌曲信息",
+      "/search": "GET/POST - 搜索音乐",
+      "/playlist": "GET/POST - 获取歌单详情",
+      "/album": "GET/POST - 获取专辑详情",
+      "/download": "GET/POST - 下载音乐",
+      "/stream": "GET - 流式播放（边下边发，支持 Range）",
+      "/api/info": "GET - API信息"
+    },
+    "supported_qualities": ["standard", "exhigh", "lossless", "hires", "sky", "jyeffect", "jymaster"],
+    "config": {
+      "downloads_dir": "/app/downloads",
+      "max_file_size": "500MB",
+      "request_timeout": "30s"
+    }
+  }
+}
+```
+
+**用途**：能力自发现。前端或客户端启动时打一次，就能拿到服务版本、全部端点、支持的音质和关键配置，
+不用把接口清单硬编码在前端——后续加接口，前端跟着自动适配。
+
+> `supported_qualities` 是**接口自报的**音质列表，实际解析时 `/song`、`/download`、`/stream`
+> 还额外接受 `dolby` 参数（这里没列进去，是当前实现的已知小偏差）；以实际调用是否 404 为准。
+>
+> `downloads_dir` 是运行时的绝对路径：容器内为 `/app/downloads`，本地直接 `python main.py`
+> 则是项目下 `downloads/` 的绝对路径。
+
 ---
 
 ## 音质参数说明（仅限单曲解析）
@@ -304,9 +372,11 @@ curl -o /dev/null -w "TTFB=%{time_starttransfer}s\n" -r 0-65535 \
 - `jyeffect`：高清环绕声
 - `sky`：沉浸环绕声
 - `jymaster`：超清母带
+- `dolby`：杜比全景声
 
 > 黑胶VIP音质：standard, exhigh, lossless, hires, jyeffect  
-> 黑胶SVIP音质：sky, jymaster
+> 黑胶SVIP音质：sky, jymaster  
+> `dolby` 需要账号有对应权益，拿不到直链时接口返回 404
 
 ---
 

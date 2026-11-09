@@ -1,7 +1,7 @@
-# 用 3.12 而不是上游的 3.9：requirements.txt 里锁了 click==8.2.1，它要求 Python >= 3.10，
-# 3.9 上直接装不上（CI 报错 No matching distribution found for click==8.2.1）。
-# 顺带 3.9 已于 2025-10 停止维护。所有二进制依赖在 3.12 下都有 musllinux wheel（amd64 + arm64）。
-FROM python:3.12-alpine3.21
+# Python 3.12：requirements.txt 里锁了 click==8.2.1，它要求 Python >= 3.10。
+# 所有二进制依赖在 3.12 下都有 musllinux wheel（amd64 + arm64）。
+# alpine 3.23 跟随上游；3.12 + alpine3.23 这一组合未经本仓库 CI 验证过时请回退到 alpine3.21。
+FROM python:3.12-alpine3.23
 
 # OCI 元信息（GHCR 会读取，便于追溯镜像来源）
 LABEL org.opencontainers.image.title="netease-url" \
